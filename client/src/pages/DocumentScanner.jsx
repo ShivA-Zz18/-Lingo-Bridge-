@@ -159,7 +159,6 @@ export default function DocumentScanner() {
           return;
         }
 
-        console.log(`📤 Uploading file: ${file.name} (${file.type})`);
         setLoadingStatus("📤 Uploading file to server...");
 
         // Create FormData with file object (NOT just filename)
@@ -183,14 +182,10 @@ export default function DocumentScanner() {
             },
           });
 
-          console.log("Backend response:", response.data);
-          setLoadingStatus(""); 
+          setLoadingStatus('');
           setLoading(false);
 
           if (response.data.success) {
-            console.log(`✅ Document processed successfully`);
-            console.log(`   Processing stages:`, response.data.data.processingStages);
-            console.log(`   Confidence: ${response.data.data.confidence}`);
 
             setResult({
               originalText: response.data.data.originalText,
@@ -209,8 +204,7 @@ export default function DocumentScanner() {
             setError(response.data.error || "Backend processing failed");
           }
         } catch (err) {
-          console.error("❌ Upload/Processing Error:", err);
-          setLoadingStatus(""); 
+          setLoadingStatus('');
           setLoading(false);
 
           // Better error messages
@@ -232,8 +226,7 @@ export default function DocumentScanner() {
         }
       }
     } catch (err) {
-      console.error("Error:", err);
-      setError(err.message || "Error processing document");
+      setError(err.message || 'Error processing document');
       setLoading(false);
     }
   };

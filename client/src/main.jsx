@@ -29,6 +29,5 @@ if ("serviceWorker" in navigator) {
       }
     });
     
-    console.log("🧹 Service Workers unregistered and caches cleared. Please reload!");
   });
 }

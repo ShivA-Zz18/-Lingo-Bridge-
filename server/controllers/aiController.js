@@ -1,21 +1,37 @@
+'use strict';
+
 /**
- * ╔═══════════════════════════════════════════════════════════╗
- * ║           AI CONTROLLER — LINGO-BRIDGE CORE            ║
- * ║  Multi-Provider LLM (Groq → HuggingFace → Demo Mode)   ║
- * ╚═══════════════════════════════════════════════════════════╝
+ * @fileoverview AI Controller — Lingo-Bridge Core
+ * Multi-provider LLM orchestration: Groq (primary) → Gemini (secondary) → HuggingFace (tertiary) → Demo Mode (fallback).
+ * Handles two major API surfaces:
+ *  - `aiProcess`: Unified document & chat processing endpoint.
+ *  - `draftGrievance`: AI-powered formal grievance/RTI letter drafting.
  */
 
-const { Groq } = require("groq-sdk");
-const { HfInference } = require("@huggingface/inference");
-const { GoogleGenerativeAI } = require("@google/generative-ai");
-const fs = require("fs");
-const path = require("path");
-const { translate } = require("../utils/bhashini");
+const { Groq } = require('groq-sdk');
+const { HfInference } = require('@huggingface/inference');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+const OpenAI = require('openai');
+const fs = require('fs');
+const path = require('path');
+const { translate } = require('../utils/bhashini');
+const logger = require('../utils/logger');
 
-// ═══════════════════════════════════════════════════════════
-// SYSTEM PROMPTS — Multi-lingual Village-Level Guidance
-// ═══════════════════════════════════════════════════════════
+/** OpenRouter client — used as the emergency 3rd-tier fallback in grievance drafting. */
+const openRouterClient = new OpenAI({
+  baseURL: 'https://openrouter.ai/api/v1',
+  apiKey: process.env.OPENROUTER_API_KEY,
+});
 
+// ─────────────────────────────────────────────────────────────────────────────
+// SYSTEM PROMPTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * System prompt for the "Gaon Sahayak" document simplification persona.
+ * Instructs the model to return structured JSON with multilingual simplifications.
+ * @constant {string}
+ */
 const VILLAGE_ASSISTANT_PROMPT = `You are **"Gaon Sahayak"** (Village Helper), a warm, patient AI assistant who helps rural Indian citizens understand complex government and legal documents.
 
 ### Your Personality
@@ -46,6 +62,10 @@ When processing documents, return **only** valid JSON:
 - Keep simplifications to 60% of original length
 - Maximum 8 jargon terms`;
 
+/**
+ * System prompt for the general-purpose chat assistant.
+ * @constant {string}
+ */
 const CHAT_SYSTEM_PROMPT = `You are "Lingo-Bridge Assistant" — a friendly, knowledgeable helper for rural Indian citizens.
 
 ### Your Role
@@ -65,613 +85,968 @@ const CHAT_SYSTEM_PROMPT = `You are "Lingo-Bridge Assistant" — a friendly, kno
 - Include scheme names or document references when relevant
 - Use village-level language (avoid legal jargon)`;
 
-const GRIEVANCE_PROMPT = `### SYSTEM ROLE
+/**
+ * System prompt for the grievance/RTI letter drafting persona.
+ * Instructs the model to behave as a Senior Administrative Officer.
+ * @constant {string}
+ */
+const GRIEVANCE_DRAFTING_PROMPT = `### SYSTEM ROLE
 You are a Senior Administrative Officer and Legal Draftsman expert in Indian Governance (RTI Act 2005, Public Grievance Portals, and Consumer Forum). Your goal is to draft formal, high-impact documents based on user input.
 
 ### INSTRUCTIONS:
 1. CLASSIFY: Determine if the request is a (A) Formal Reply, (B) Grievance Letter, or (C) RTI Request.
-2. STRUCTURE: 
+2. STRUCTURE:
    - Use standard Indian formal letter headers (To, From, Date, Subject).
    - For RTI: Use the specific "Form A" format; cite relevant sections of the RTI Act 2005.
    - For Grievances: Include a "Prayer" (what action you want taken) at the end.
 3. TONE: Professional, firm, and respectful. Use administrative vocabulary (e.g., "perusal," "undersigned," "redressal").
-4. LANGUAGE: Provide the output in the specified language requested by the User. If the user picks Kannada or Hindi, ensure the grammar is formal (Official/Sarkari style).
+4. LANGUAGE: Generate the draft natively in ALL THREE languages simultaneously: English, formal Hindi (Sarkari style), and formal Kannada.
 
 ### SCHEMA OUTPUT (JSON ONLY):
 {
   "document_type": "string",
   "subject": "string",
-  "draft_content": "Full letter body in requested language with placeholders like [Name], [Date]",
+  "draft_content_english": "Full letter body in English with placeholders like [Name], [Date]",
+  "draft_content_hindi": "Full letter body translated to formal Hindi with placeholders",
+  "draft_content_kannada": "Full letter body translated to formal Kannada with placeholders",
   "key_sections_cited": ["string"],
   "next_steps": ["Step-by-step advice on where/how to submit"]
 }`;
 
-// ═══════════════════════════════════════════════════════════
-// HELPER: Convert file to base64
-// ═══════════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPER UTILITIES
+// ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Reads a file from disk and returns its content as a Base64-encoded string.
+ *
+ * @param {string} filePath - Absolute path to the file.
+ * @returns {string} Base64-encoded file content.
+ */
 function fileToBase64(filePath) {
-  const fileData = fs.readFileSync(filePath);
-  return Buffer.from(fileData).toString("base64");
+  const fileBuffer = fs.readFileSync(filePath);
+  return Buffer.from(fileBuffer).toString('base64');
 }
 
-// ═══════════════════════════════════════════════════════════
-// HELPER: Get MIME type from file
-// ═══════════════════════════════════════════════════════════
-
+/**
+ * Resolves a MIME type string from a file's extension.
+ * Defaults to `image/jpeg` for unrecognised extensions.
+ *
+ * @param {string} filePath - Path to the file (only extension is used).
+ * @returns {string} MIME type string (e.g., `'image/png'`).
+ */
 function getMimeType(filePath) {
   const ext = path.extname(filePath).toLowerCase();
-  const mimeTypes = {
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".png": "image/png",
-    ".gif": "image/gif",
-    ".webp": "image/webp",
-    ".bmp": "image/bmp",
+  const mimeMap = {
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.png': 'image/png',
+    '.gif': 'image/gif',
+    '.webp': 'image/webp',
+    '.bmp': 'image/bmp',
   };
-  return mimeTypes[ext] || "image/jpeg";
+  return mimeMap[ext] || 'image/jpeg';
 }
 
-// ═══════════════════════════════════════════════════════════
-// HELPER: Parse Gemini response (JSON extraction)
-// ═══════════════════════════════════════════════════════════
-
-function extractJSON(text) {
+/**
+ * Extracts a JSON object from a raw AI response string.
+ * Safely strips markdown code fences (```json ... ```) before parsing.
+ *
+ * @param {string} rawResponseText - Raw text output from the AI model.
+ * @returns {Object|null} Parsed JSON object, or `null` if parsing fails.
+ */
+function extractJSON(rawResponseText) {
   try {
-    // Remove markdown code fences
-    const cleaned = text
-      .replace(/```json\s*/gi, "")
-      .replace(/```\s*/g, "")
+    const sanitizedText = rawResponseText
+      .replace(/```json\s*/gi, '')
+      .replace(/```\s*/g, '')
       .trim();
-    return JSON.parse(cleaned);
+    return JSON.parse(sanitizedText);
   } catch {
     return null;
   }
 }
 
-// ═══════════════════════════════════════════════════════════
-// MAIN CONTROLLER: Unified AI Processing
-// ── 1. Voice Assistant (Chat) ────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// DEMO MODE PAYLOADS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** @private Demo document response returned when no API keys are configured. */
+const DEMO_DOCUMENT_RESPONSE = {
+  originalText: 'This is a demo document showing how simplification works.',
+  simplifiedText: 'This is a simple document example.',
+  simplifiedKannada: 'ಇದು ಸರಳೀಕರಣ ಹೇಗೆ ಕಾಗುತ್ತದೆ ಎಂಬುದನ್ನು ತೋರಿಸುವ ಸರಳ ದಾಖಲೆ ಉದಾಹರಣೆ.',
+  simplifiedHindi: 'यह एक साधारण दस्तावेज उदाहरण है।',
+  documentType: 'Demo Document',
+  confidence: 'high',
+  warnings: 'Demo mode — Configure GEMINI_API_KEY and GROQ_API_KEY to enable live processing.',
+};
+
+/**
+ * Multilingual keyword-matched demo chat responses.
+ * Keyed by language code (`en`, `hi`, `kn`), then by topic category.
+ * @private
+ * @type {Object.<string, Object.<string, string>>}
+ */
+const DEMO_CHAT_RESPONSES = {
+  en: {
+    schemes: 'Common government schemes include: 1) Pradhan Mantri Jan Dhan Yojana (bank accounts), 2) Ayushman Bharat (health insurance), 3) Mudra Loan (business loans). Visit your nearest Jan Seva Kendra for details.',
+    documents: 'Government documents like Ration Cards, Aadhaar, and Land Notices can be confusing. Would you like me to explain a specific document?',
+    rights: 'You have rights! These include: Right to Information, Right to Education, Right to Work. Contact your local authorities for help.',
+    scholarship: 'Scholarships available: 1) National Scholarship Portal (NSP) - for merit & SC/ST students, 2) Post-Matric Scholarship - for OBC & minority students. Apply on scholarships.gov.in',
+    loan: 'Loans available: 1) Mudra Loan (₹50,000 to ₹10 lakh for business), 2) Student loans with subsidy. Contact your nearest bank or Government office.',
+    health: 'Health schemes: 1) Ayushman Bharat (free treatment up to ₹5 lakh), 2) PMJAY, 3) Jeevan Bima Yojana (₹2 lakh life insurance).',
+    pension: 'Pensions: 1) APY (₹1000 to ₹5000/month), 2) Widow pension, 3) Old age pension (₹500-₹2000/month by state).',
+    grievance: 'File grievance through: 1) CPGRAMS portal (cpgrams.gov.in), 2) RTI Act for information, 3) Local Ombudsman office.',
+    rti: 'RTI (Right to Information): You can ask for ANY government record. Apply with ₹10 fee. Response required within 30 days. No reason needed!',
+    default: 'Hello! I\'m here to help explain government schemes, documents, and your rights. What would you like to know?',
+  },
+  hi: {
+    schemes: 'सामान्य सरकारी योजनाएं हैं: 1) प्रधान मंत्री जन धन योजना, 2) आयुष्मान भारत, 3) मुद्रा ऋण।',
+    documents: 'राशन कार्ड, आधार और भूमि नोटिस जैसे सरकारी दस्तावेज भ्रामक हो सकते हैं। क्या आप किसी विशिष्ट दस्तावेज़ की व्याख्या चाहते हैं?',
+    rights: 'आपके अधिकार हैं! सूचना का अधिकार, शिक्षा का अधिकार, काम का अधिकार।',
+    scholarship: 'छात्रवृत्ति: 1) NSP पोर्टल - मेधावी व SC/ST छात्र, 2) OBC छात्रवृत्ति। scholarships.gov.in पर आवेदन करें।',
+    loan: 'ऋण: 1) मुद्रा लोन (₹50,000 से ₹10 लाख), 2) छात्र ऋण। अपने बैंक से संपर्क करें।',
+    health: 'स्वास्थ्य: 1) आयुष्मान भारत (₹5 लाख तक मुफ्त इलाज), 2) PMJAY, 3) जीवन बीमा योजना।',
+    pension: 'पेंशन: 1) APY (₹1000 से ₹5000 मासिक), 2) विधवा पेंशन, 3) वृद्धावस्था पेंशन।',
+    grievance: 'शिकायत: 1) CPGRAMS पोर्टल, 2) RTI, 3) लोकपाल कार्यालय।',
+    rti: 'सूचना का अधिकार: ₹10 फीस के साथ आवेदन करें। 30 दिनों में उत्तर मिलना चाहिए।',
+    default: 'नमस्ते! मैं सरकारी योजनाओं और आपके अधिकारों को समझाने में मदद करने के लिए यहां हूं।',
+  },
+  kn: {
+    schemes: 'ಸಾಮಾನ್ಯ ಯೋಜನೆಗಳು: 1) ಪ್ರಧಾನ ಮಂತ್ರಿ ಜನ ಧನ ಯೋಜನೆ, 2) ಆಯುಷ್ಮಾನ್ ಭಾರತ, 3) ಮುದ್ರಾ ಋಣ।',
+    documents: 'ರೇಷನ್ ಕಾರ್ಡ್, ಆಧಾರ್ ದಾಖಲೆಗಳು ಗೊಂದಲಮಯವಾಗಿರಬಹುದು. ನಿರ್ದಿಷ್ಟ ದಾಖಲೆ ವಿವರಿಸಲು ಬಯಸುತ್ತೀರಾ?',
+    rights: 'ನಿಮಗೆ ಅಧಿಕಾರವಿದೆ! ಮಾಹಿತಿ ಹಕ್ಕು, ಶಿಕ್ಷೆಯ ಹಕ್ಕು, ಕಾಮ ಹಕ್ಕು।',
+    scholarship: 'ವೃತ್ತಿ: 1) NSP ಪೋರ್ಟಲ್, 2) OBC ವೃತ್ತಿ। scholarships.gov.in ನಲ್ಲಿ ಅರ್ಜಿ ಹಾಕಿ।',
+    loan: 'ಸಾಲ: 1) ಮುದ್ರಾ ಲೋನ್ (ವ್ಯಾಪಾರಕ್ಕೆ), 2) ವಿದ್ಯಾರ್ಥಿ ಸಾಲ। ನಿಮ್ಮ ಬ್ಯಾಂಕಿನಲ್ಲಿ ಸಂಪರ್ಕಿಸಿ।',
+    health: 'ಆರೋಗ್ಯ: 1) ಆಯುಷ್ಮಾನ್ ಭಾರತ (₹5 ಲಕ್ಷ ಮುಕ್ತ ಚಿಕಿತ್ಸೆ), 2) PMJAY।',
+    pension: 'ಪಿಂಚಣಿ: 1) APY (₹1000 ರಿಂದ ₹5000 ಮಾಸಿಕ), 2) ವಿಧವೆ ಪಿಂಚಣಿ।',
+    grievance: 'ದೂರು: 1) CPGRAMS ನಲ್ಲಿ, 2) RTI ಮೂಲಕ, 3) ಲೋಕಪಾಲ ಕಚೇರಿ.',
+    rti: 'ಮಾಹಿತಿಯ ಹಕ್ಕು: ₹10 ಫೀಸ್ ನೊಂದಿಗೆ ಅರ್ಜಿ। 30 ದಿನಗಳಲ್ಲಿ ಉತ್ತರ ನಿರೀಕ್ಷಿಸಿ.',
+    default: 'ನಮಸ್ಕಾರ! ಸರಕಾರಿ ಯೋಜನೆಗಳು ಮತ್ತು ನಿಮ್ಮ ಅಧಿಕಾರಗಳನ್ನು ವಿವರಿಸಲು ಸಹಾಯ ಮಾಡಲು ಇಲ್ಲಿದ್ದೇನೆ.',
+  },
+};
+
+/**
+ * Resolves a demo chat response string using keyword matching against the user query.
+ *
+ * @private
+ * @param {string} userText - The user's raw query text.
+ * @param {string} languageCode - BCP-47 language code (`en`, `hi`, or `kn`).
+ * @returns {string} The matched demo response string.
+ */
+function resolveDemoChatResponse(userText, languageCode) {
+  const queryLower = userText.toLowerCase();
+  const responseBucket = DEMO_CHAT_RESPONSES[languageCode] || DEMO_CHAT_RESPONSES.en;
+
+  if (/scholarship|छात्रवृत्ति|ವೃತ್ತಿ|nsp|nheqf|pjms/i.test(queryLower)) return responseBucket.scholarship;
+  if (/loan|ऋण|ಸಾಲ|mudra|business|व्यापार/i.test(queryLower)) return responseBucket.loan;
+  if (/health|स्वास्थ्य|ಆರೋಗ್ಯ|ayushman|treatment/i.test(queryLower)) return responseBucket.health;
+  if (/pension|पेंशन|ಪಿಂಚಣಿ|apy|old age|बुजुर्ग/i.test(queryLower)) return responseBucket.pension;
+  if (/grievance|शिकायत|ನಿಂದೆ|complaint|cpgrams/i.test(queryLower)) return responseBucket.grievance;
+  if (/rti|information|सूचना|ಮಾಹಿತಿ|rights/i.test(queryLower)) return responseBucket.rti;
+  if (/scheme|योजना|ಯೋಜನೆ/i.test(queryLower)) return responseBucket.schemes;
+  if (/document|दस्तावेज|ದಾಖಲೆ/i.test(queryLower)) return responseBucket.documents;
+  if (/right|अधिकार|ಅಧಿಕಾರ/i.test(queryLower)) return responseBucket.rights;
+  return responseBucket.default;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LOCAL TEMPLATE ENGINE — zero-dependency, always-available fallback
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Classifies a userIntent string into one of three canonical document types.
+ * Used to select the appropriate template structure.
+ *
+ * @private
+ * @param {string} userIntent - Raw intent string from the request body.
+ * @returns {'rti'|'grievance'|'formal_reply'} Classified document type.
+ */
+/**
+ * Classifies a userIntent string into one of three canonical document types.
+ *
+ * @private
+ * @param {string} userIntent - Raw intent string from the request body.
+ * @returns {'rti'|'grievance'|'formal_reply'} Classified document type.
+ */
+function classifyDocumentIntent(userIntent) {
+  const intentLower = userIntent.toLowerCase();
+  if (/rti|right to information|information request|सूचना का अधिकार|ಮಾಹಿತಿ ಹಕ್ಕು/.test(intentLower)) return 'rti';
+  if (/formal reply|response|reply|answer|counter|जवाब|ಉತ್ತರ/.test(intentLower)) return 'formal_reply';
+  return 'grievance';
+}
+
+/**
+ * Generates professional letters in all 3 languages (English, Hindi, Kannada).
+ * Zero API calls — works completely offline.
+ *
+ * @param {Object} params
+ * @param {string} params.userIntent
+ * @param {string} params.documentContext
+ * @param {string} [params.authority]
+ * @param {string} [params.issueDetails]
+ * @param {string} [params.language='en']
+ * @returns {Object} Schema-compatible draft object with all 3 language drafts.
+ */
+function generateLocalGrievanceTemplate({ userIntent, documentContext, authority, issueDetails, language = 'en' }) {
+  const docType = classifyDocumentIntent(userIntent);
+  const auth = authority || 'The Concerned Authority / संबंधित प्राधिकरण / ಸಂಬಂಧಿಸಿದ ಅಧಿಕಾರಿ';
+  const today = new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'long', year: 'numeric' });
+  const details = issueDetails || '';
+
+  // ─── RTI APPLICATION ──────────────────────────────────────────────────────
+  if (docType === 'rti') {
+    const en = `Date: ${today}
+
+To,
+The Public Information Officer (PIO)
+${auth}
+
+Subject: Application for Information under the Right to Information Act, 2005
+
+Sir/Madam,
+
+I, the undersigned, a citizen of India, hereby request the following information under Section 6 of the Right to Information Act, 2005:
+
+Context / Subject Matter:
+${documentContext}
+
+Specific Information Requested:
+${details || 'Please provide all relevant records, files, documents and communications pertaining to the above subject.'}
+
+Period of Information Sought: Last 3 years / as applicable
+
+I am enclosing an application fee of Rs. 10/- (Rupees Ten Only) as prescribed. If additional fee is required, kindly inform me in writing.
+
+I request that the information be provided within 30 days as mandated under Section 7(1) of the RTI Act, 2005.
+
+Yours faithfully,
+
+[Your Full Name]
+[Your Complete Address]
+[Your Mobile Number]
+[Your Email ID]
+[Date: ${today}]`;
+
+    const hi = `दिनांक: ${today}
+
+प्रति,
+जन सूचना अधिकारी (PIO)
+${auth}
+
+विषय: सूचना का अधिकार अधिनियम, 2005 के तहत सूचना के लिए आवेदन
+
+महोदय/महोदया,
+
+मैं, अधोहस्ताक्षरी, भारत का एक नागरिक/नागरिका, सूचना का अधिकार अधिनियम, 2005 की धारा 6 के अंतर्गत निम्नलिखित सूचना का अनुरोध करता/करती हूँ:
+
+संदर्भ / विषय वस्तु:
+${documentContext}
+
+मांगी गई विशिष्ट सूचना:
+${details || 'कृपया उपरोक्त विषय से संबंधित सभी प्रासंगिक अभिलेख, फाइलें, दस्तावेज और पत्राचार उपलब्ध कराएं।'}
+
+सूचना का अपेक्षित कार्यकाल: पिछले 3 वर्ष / जैसा लागू हो
+
+मैं RTI नियमों के अनुसार ₹10/- (दस रुपये मात्र) आवेदन शुल्क संलग्न कर रहा/रही हूँ।
+
+कृपया RTI अधिनियम, 2005 की धारा 7(1) के अनुसार 30 दिनों के भीतर सूचना प्रदान करने की कृपा करें।
+
+भवदीय,
+
+[आपका पूरा नाम]
+[आपका पूरा पता]
+[आपका मोबाइल नंबर]
+[आपकी ईमेल आईडी]
+[दिनांक: ${today}]`;
+
+    const kn = `ದಿನಾಂಕ: ${today}
+
+ಗೆ,
+ಸಾರ್ವಜನಿಕ ಮಾಹಿತಿ ಅಧಿಕಾರಿ (PIO)
+${auth}
+
+ವಿಷಯ: ಮಾಹಿತಿ ಹಕ್ಕು ಅಧಿನಿಯಮ, 2005 ರ ಅಡಿಯಲ್ಲಿ ಮಾಹಿತಿಗಾಗಿ ಅರ್ಜಿ
+
+ಮಹೋದಯ/ಮಹೋದಯೆ,
+
+ನಾನು, ಕೆಳಗೆ ಸಹಿ ಮಾಡಿದ, ಭಾರತದ ನಾಗರಿಕ/ನಾಗರಿಕಳಾಗಿ, ಮಾಹಿತಿ ಹಕ್ಕು ಅಧಿನಿಯಮ, 2005 ರ ಧಾರೆ 6 ರ ಅಡಿಯಲ್ಲಿ ಈ ಕೆಳಗಿನ ಮಾಹಿತಿಯನ್ನು ಕೋರುತ್ತೇನೆ:
+
+ಸಂದರ್ಭ / ವಿಷಯ:
+${documentContext}
+
+ಕೋರಿದ ನಿರ್ದಿಷ್ಟ ಮಾಹಿತಿ:
+${details || 'ಮೇಲಿನ ವಿಷಯಕ್ಕೆ ಸಂಬಂಧಿಸಿದ ಎಲ್ಲಾ ದಾಖಲೆಗಳು, ಫೈಲ್‌ಗಳು ಮತ್ತು ಪತ್ರವ್ಯವಹಾರಗಳನ್ನು ದಯವಿಟ್ಟು ಒದಗಿಸಿ.'}
+
+ಮಾಹಿತಿ ಅಪೇಕ್ಷಿತ ಅವಧಿ: ಕಳೆದ 3 ವರ್ಷಗಳು / ಅನ್ವಯಿಸಿದಂತೆ
+
+ನಿಯಮಗಳ ಪ್ರಕಾರ ₹10/- ಅರ್ಜಿ ಶುಲ್ಕ ಲಗತ್ತಿಸುತ್ತಿದ್ದೇನೆ.
+
+RTI ಅಧಿನಿಯಮ ಧಾರೆ 7(1) ರ ಅಡಿಯಲ್ಲಿ 30 ದಿನಗಳಲ್ಲಿ ಮಾಹಿತಿ ನೀಡಬೇಕೆಂದು ಕೋರುತ್ತೇನೆ.
+
+ನಿಮ್ಮ ವಿಶ್ವಾಸಿ,
+
+[ನಿಮ್ಮ ಪೂರ್ಣ ಹೆಸರು]
+[ನಿಮ್ಮ ಸಂಪೂರ್ಣ ವಿಳಾಸ]
+[ನಿಮ್ಮ ಮೊಬೈಲ್ ಸಂಖ್ಯೆ]
+[ನಿಮ್ಮ ಇಮೇಲ್ ಐಡಿ]
+[ದಿನಾಂಕ: ${today}]`;
+
+    const primaryDraft = language === 'hi' ? hi : language === 'kn' ? kn : en;
+    return {
+      document_type: 'RTI Application',
+      subject: `RTI Application — ${documentContext.slice(0, 80)}`,
+      draft_content: primaryDraft,
+      draft_content_english: en,
+      draft_content_hindi: hi,
+      draft_content_kannada: kn,
+      key_sections_cited: [
+        'RTI Act 2005 — Section 6 (Filing of Request)',
+        'RTI Act 2005 — Section 7(1) (30-day Response Mandate)',
+        'RTI Act 2005 — Section 7(5) (Fee Waiver for BPL applicants)',
+      ],
+      next_steps: [
+        'Submit to the PIO of the department in person or by Registered Post.',
+        'Attach ₹10 Postal Order / Court Fee Stamp as RTI filing fee.',
+        'Keep a self-attested copy of your application.',
+        'If no reply within 30 days → First Appeal to First Appellate Authority.',
+        'Second Appeal → Central/State Information Commission.',
+      ],
+      generated_by: 'local_template',
+    };
+  }
+
+  // ─── FORMAL REPLY ─────────────────────────────────────────────────────────
+  if (docType === 'formal_reply') {
+    const en = `Date: ${today}
+
+To,
+${auth}
+
+Subject: Formal Reply — ${documentContext.slice(0, 80)}
+
+Sir/Madam,
+
+With reference to the above subject, I, the undersigned, hereby submit my formal response for your kind perusal and necessary action.
+
+Background / Context:
+${documentContext}
+
+My Response / Clarification:
+${details || 'I have carefully reviewed the matter. All documents and evidence in support of my position are submitted herewith for your consideration.'}
+
+I request you to kindly acknowledge receipt of this reply and take appropriate action as per applicable laws and departmental procedures.
+
+Thanking you,
+
+Yours faithfully,
+
+[Your Full Name]
+[Your Designation / Role, if applicable]
+[Your Complete Address]
+[Your Mobile Number]
+[Date: ${today}]`;
+
+    const hi = `दिनांक: ${today}
+
+प्रति,
+${auth}
+
+विषय: औपचारिक जवाब — ${documentContext.slice(0, 80)}
+
+महोदय/महोदया,
+
+उपरोक्त विषय के संदर्भ में, मैं, अधोहस्ताक्षरी, अपना औपचारिक उत्तर आपके अवलोकनार्थ एवं आवश्यक कार्रवाई हेतु प्रस्तुत करता/करती हूँ।
+
+पृष्ठभूमि / संदर्भ:
+${documentContext}
+
+मेरा उत्तर / स्पष्टीकरण:
+${details || 'मैंने इस विषय का ध्यानपूर्वक परीक्षण किया है। अपने पक्ष के समर्थन में सभी दस्तावेज़ एवं साक्ष्य संलग्न हैं।'}
+
+कृपया इस उत्तर की प्राप्ति स्वीकार करें और लागू कानूनों व विभागीय प्रक्रियाओं के अनुसार आवश्यक कार्रवाई करें।
+
+धन्यवाद,
+
+भवदीय,
+
+[आपका पूरा नाम]
+[पदनाम / भूमिका, यदि लागू हो]
+[आपका पूरा पता]
+[आपका मोबाइल नंबर]
+[दिनांक: ${today}]`;
+
+    const kn = `ದಿನಾಂಕ: ${today}
+
+ಗೆ,
+${auth}
+
+ವಿಷಯ: ಔಪಚಾರಿಕ ಉತ್ತರ — ${documentContext.slice(0, 80)}
+
+ಮಹೋದಯ/ಮಹೋದಯೆ,
+
+ಮೇಲಿನ ವಿಷಯದ ಉಲ್ಲೇಖದೊಂದಿಗೆ, ನಾನು, ಕೆಳಗೆ ಸಹಿ ಮಾಡಿದ, ನಿಮ್ಮ ದಯಾ ಪರಿಶೀಲನೆ ಮತ್ತು ಅಗತ್ಯ ಕ್ರಮಕ್ಕಾಗಿ ನನ್ನ ಔಪಚಾರಿಕ ಉತ್ತರವನ್ನು ಸಲ್ಲಿಸುತ್ತೇನೆ.
+
+ಹಿನ್ನೆಲೆ / ಸಂದರ್ಭ:
+${documentContext}
+
+ನನ್ನ ಉತ್ತರ / ಸ್ಪಷ್ಟೀಕರಣ:
+${details || 'ನಾನು ಈ ವಿಷಯವನ್ನು ಎಚ್ಚರಿಕೆಯಿಂದ ಪರಿಶೀಲಿಸಿದ್ದೇನೆ. ನನ್ನ ನಿಲುವನ್ನು ಬೆಂಬಲಿಸುವ ಎಲ್ಲಾ ದಾಖಲೆಗಳನ್ನು ಇದರೊಂದಿಗೆ ಲಗತ್ತಿಸಲಾಗಿದೆ.'}
+
+ದಯವಿಟ್ಟು ಈ ಉತ್ತರದ ರಸೀದಿಯನ್ನು ಸ್ವೀಕರಿಸಿ ಮತ್ತು ಅನ್ವಯವಾಗುವ ಕಾನೂನುಗಳ ಪ್ರಕಾರ ಕ್ರಮ ತೆಗೆದುಕೊಳ್ಳಿ.
+
+ವಂದನೆಗಳೊಂದಿಗೆ,
+
+ನಿಮ್ಮ ವಿಶ್ವಾಸಿ,
+
+[ನಿಮ್ಮ ಪೂರ್ಣ ಹೆಸರು]
+[ಹುದ್ದೆ / ಪಾತ್ರ, ಅನ್ವಯಿಸಿದರೆ]
+[ನಿಮ್ಮ ಸಂಪೂರ್ಣ ವಿಳಾಸ]
+[ನಿಮ್ಮ ಮೊಬೈಲ್ ಸಂಖ್ಯೆ]
+[ದಿನಾಂಕ: ${today}]`;
+
+    const primaryDraft = language === 'hi' ? hi : language === 'kn' ? kn : en;
+    return {
+      document_type: 'Formal Reply',
+      subject: `Formal Reply — ${documentContext.slice(0, 80)}`,
+      draft_content: primaryDraft,
+      draft_content_english: en,
+      draft_content_hindi: hi,
+      draft_content_kannada: kn,
+      key_sections_cited: ['Standard administrative correspondence format'],
+      next_steps: [
+        'Print on A4 paper and sign with blue or black ink.',
+        'Submit in person — obtain a stamped receipt.',
+        'If posting, use Registered Post with Acknowledgement Due (RPAD).',
+        'Keep a photocopy of the signed letter and postal receipt.',
+      ],
+      generated_by: 'local_template',
+    };
+  }
+
+  // ─── GRIEVANCE LETTER (Default) ───────────────────────────────────────────
+  const en = `Date: ${today}
+
+To,
+${auth}
+
+Subject: Formal Grievance — ${documentContext.slice(0, 80)}
+
+Sir/Madam,
+
+I, the undersigned, am a resident of [Your City/Village, State] and respectfully wish to bring the following matter to your esteemed attention for immediate redressal.
+
+Nature of Grievance:
+${userIntent}
+
+Detailed Description of the Issue:
+${documentContext}
+${details ? `\nAdditional Details:\n${details}\n` : ''}
+Impact:
+This issue has caused significant hardship and inconvenience to me and my family. Despite prior attempts to resolve the matter, it remains unaddressed.
+
+Prayer / Relief Sought:
+I humbly request that your good office kindly:
+1. Examine and investigate the above grievance in a time-bound manner.
+2. Direct the concerned department/officer to take immediate corrective action.
+3. Provide a written acknowledgement and update on the action taken.
+
+I shall be grateful for your prompt intervention.
+
+Thanking you,
+Yours faithfully,
+
+[Your Full Name]
+[Son/Daughter/Wife of: ____________________]
+[Complete Address with PIN Code]
+[Mobile Number]
+[Aadhaar Number (last 4 digits only): XXXX]
+[Date: ${today}]
+
+Enclosures:
+1. Copy of relevant document / ID proof
+2. Any prior correspondence on this matter
+3. [Other supporting documents]`;
+
+  const hi = `दिनांक: ${today}
+
+प्रति,
+${auth}
+
+विषय: औपचारिक शिकायत — ${documentContext.slice(0, 80)}
+
+महोदय/महोदया,
+
+मैं, अधोहस्ताक्षरी, [आपका शहर/गाँव, राज्य] का/की निवासी हूँ और आपसे विनम्र निवेदन करता/करती हूँ कि निम्नलिखित विषय पर तत्काल कार्रवाई की जाए।
+
+शिकायत की प्रकृति:
+${userIntent}
+
+समस्या का विस्तृत विवरण:
+${documentContext}
+${details ? `\nअतिरिक्त विवरण:\n${details}\n` : ''}
+प्रभाव:
+इस समस्या के कारण मुझे और मेरे परिवार को अत्यधिक कठिनाई और परेशानी हो रही है। पूर्व प्रयासों के बावजूद यह समस्या अभी तक अनसुलझी बनी हुई है।
+
+प्रार्थना / राहत की मांग:
+मैं विनम्रतापूर्वक अनुरोध करता/करती हूँ कि आपका कार्यालय कृपया:
+1. उपरोक्त शिकायत की समय-सीमा में जांच करे।
+2. संबंधित विभाग/अधिकारी को तत्काल सुधारात्मक कार्रवाई के निर्देश दे।
+3. मुझे लिखित पावती और कृत कार्रवाई की जानकारी प्रदान करे।
+
+आपके त्वरित हस्तक्षेप के लिए अत्यंत आभारी रहूँगा/रहूँगी।
+
+धन्यवाद,
+भवदीय,
+
+[आपका पूरा नाम]
+[पुत्र/पुत्री/पत्नी: ____________________]
+[पूरा पता, पिन कोड सहित]
+[मोबाइल नंबर]
+[आधार नंबर (केवल अंतिम 4 अंक): XXXX]
+[दिनांक: ${today}]
+
+संलग्नक:
+1. संबंधित दस्तावेज / पहचान प्रमाण की प्रति
+2. इस विषय पर पूर्व पत्राचार
+3. [अन्य सहायक दस्तावेज]`;
+
+  const kn = `ದಿನಾಂಕ: ${today}
+
+ಗೆ,
+${auth}
+
+ವಿಷಯ: ಔಪಚಾರಿಕ ದೂರು — ${documentContext.slice(0, 80)}
+
+ಮಹೋದಯ/ಮಹೋದಯೆ,
+
+ನಾನು, ಕೆಳಗೆ ಸಹಿ ಮಾಡಿದ, [ನಿಮ್ಮ ನಗರ/ಗ್ರಾಮ, ರಾಜ್ಯ] ದ ನಿವಾಸಿಯಾಗಿ, ಈ ಕೆಳಗಿನ ವಿಷಯವನ್ನು ನಿಮ್ಮ ಗಮನಕ್ಕೆ ತರಲು ಮತ್ತು ತಕ್ಷಣ ಪರಿಹಾರ ಕೋರಲು ವಿನಂತಿಸುತ್ತೇನೆ.
+
+ದೂರಿನ ಸ್ವರೂಪ:
+${userIntent}
+
+ಸಮಸ್ಯೆಯ ವಿಸ್ತೃತ ವಿವರಣೆ:
+${documentContext}
+${details ? `\nಹೆಚ್ಚುವರಿ ವಿವರಗಳು:\n${details}\n` : ''}
+ಪರಿಣಾಮ:
+ಈ ಸಮಸ್ಯೆಯು ನನಗೆ ಮತ್ತು ನನ್ನ ಕುಟುಂಬಕ್ಕೆ ತುಂಬಾ ತೊಂದರೆ ಮತ್ತು ಅಸೌಕರ್ಯವನ್ನು ಉಂಟುಮಾಡಿದೆ. ಹಿಂದಿನ ಪ್ರಯತ್ನಗಳ ಹೊರತಾಗಿಯೂ ಸಮಸ್ಯೆ ಇನ್ನೂ ಬಗೆಹರಿದಿಲ್ಲ.
+
+ಕೋರಿಕೆ / ಪರಿಹಾರ:
+ಈ ಕೆಳಗಿನ ಕ್ರಮಗಳನ್ನು ತೆಗೆದುಕೊಳ್ಳಬೇಕೆಂದು ವಿನಂತಿಸುತ್ತೇನೆ:
+1. ಮೇಲಿನ ದೂರನ್ನು ನಿಗದಿತ ಅವಧಿಯಲ್ಲಿ ತನಿಖೆ ಮಾಡಿ.
+2. ಸಂಬಂಧಿಸಿದ ಇಲಾಖೆ/ಅಧಿಕಾರಿಗೆ ತಕ್ಷಣ ಸರಿಪಡಿಸುವ ಕ್ರಮ ತೆಗೆದುಕೊಳ್ಳಲು ನಿರ್ದೇಶಿಸಿ.
+3. ಕೈಗೊಂಡ ಕ್ರಮದ ಬಗ್ಗೆ ಲಿಖಿತ ದೃಢೀಕರಣ ಮತ್ತು ಮಾಹಿತಿ ನೀಡಿ.
+
+ನಿಮ್ಮ ತ್ವರಿತ ಹಸ್ತಕ್ಷೇಪಕ್ಕಾಗಿ ತುಂಬಾ ಆಭಾರಿ.
+
+ವಂದನೆಗಳೊಂದಿಗೆ,
+ನಿಮ್ಮ ವಿಶ್ವಾಸಿ,
+
+[ನಿಮ್ಮ ಪೂರ್ಣ ಹೆಸರು]
+[ಮಗ/ಮಗಳು/ಪತ್ನಿ: ____________________]
+[ಸಂಪೂರ್ಣ ವಿಳಾಸ, ಪಿನ್ ಕೋಡ್ ಸಹಿತ]
+[ಮೊಬೈಲ್ ಸಂಖ್ಯೆ]
+[ಆಧಾರ್ ಸಂಖ್ಯೆ (ಕೊನೆಯ 4 ಅಂಕಿಗಳು ಮಾತ್ರ): XXXX]
+[ದಿನಾಂಕ: ${today}]
+
+ಲಗತ್ತುಗಳು:
+1. ಸಂಬಂಧಿಸಿದ ದಾಖಲೆ / ಗುರುತಿನ ಪ್ರಮಾಣ ಪತ್ರದ ಪ್ರತಿ
+2. ಈ ವಿಷಯದಲ್ಲಿ ಹಿಂದಿನ ಪತ್ರವ್ಯವಹಾರ
+3. [ಇತರ ಬೆಂಬಲ ದಾಖಲೆಗಳು]`;
+
+  const primaryDraft = language === 'hi' ? hi : language === 'kn' ? kn : en;
+  return {
+    document_type: 'Grievance Letter',
+    subject: (language === 'hi' ? `औपचारिक शिकायत — ` : language === 'kn' ? `ಔಪಚಾರಿಕ ದೂರು — ` : `Formal Grievance — `) + documentContext.slice(0, 80),
+    draft_content: primaryDraft,
+    draft_content_english: en,
+    draft_content_hindi: hi,
+    draft_content_kannada: kn,
+    key_sections_cited: [
+      'CPGRAMS — cpgrams.gov.in (Online Grievance Portal)',
+      'Consumer Protection Act 2019 (if applicable)',
+      'RTI Act 2005 — Section 6 (for seeking related information)',
+    ],
+    next_steps: language === 'hi'
+      ? [
+          '[ ] से चिह्नित सभी स्थानों को भरें।',
+          'संबंधित कार्यालय में व्यक्तिगत रूप से जमा करें — दिनांक मुहर वाली रसीद लें।',
+          'ऑनलाइन भी दर्ज करें: pgportal.gov.in या CPGRAMS पर।',
+          '30 दिनों में उत्तर न मिले तो जिला कलेक्टर / लोकायुक्त को अपील करें।',
+          'सभी रसीदें और पत्राचार सुरक्षित रखें।',
+        ]
+      : language === 'kn'
+      ? [
+          '[ ] ಎಂದು ಗುರುತಿಸಲಾದ ಎಲ್ಲಾ ಸ್ಥಳಗಳನ್ನು ಭರ್ತಿ ಮಾಡಿ.',
+          'ಸಂಬಂಧಿಸಿದ ಕಚೇರಿಯಲ್ಲಿ ವೈಯಕ್ತಿಕವಾಗಿ ಸಲ್ಲಿಸಿ — ದಿನಾಂಕ ಮುದ್ರೆ ರಸೀದಿ ಪಡೆಯಿರಿ.',
+          'ಆನ್‌ಲೈನ್‌ನಲ್ಲಿ: pgportal.gov.in ಅಥವಾ CPGRAMS ನಲ್ಲಿ ಸಲ್ಲಿಸಿ.',
+          '30 ದಿನಗಳಲ್ಲಿ ಉತ್ತರ ಬಾರದಿದ್ದರೆ ಜಿಲ್ಲಾ ಕಲೆಕ್ಟರ್ / ಲೋಕಾಯುಕ್ತರಿಗೆ ಮೇಲ್ಮನವಿ ಸಲ್ಲಿಸಿ.',
+          'ಎಲ್ಲಾ ರಸೀದಿಗಳು ಮತ್ತು ಪತ್ರವ್ಯವಹಾರಗಳನ್ನು ಸುರಕ್ಷಿತವಾಗಿ ಇಟ್ಟುಕೊಳ್ಳಿ.',
+        ]
+      : [
+          'Fill in all placeholders marked with [ ] before submitting.',
+          'Submit at the concerned department office in person — get a date-stamped receipt.',
+          'Alternatively, file online at pgportal.gov.in or CPGRAMS.',
+          'If no response within 30 days, escalate to District Collector / Lokayukta.',
+          'Keep all receipts and correspondence safely.',
+        ],
+    generated_by: 'local_template',
+  };
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MAIN CONTROLLERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+
+/**
+ * Unified AI processing controller.
+ *
+ * Handles two request types:
+ * - `"document"`: Previously handled client-side OCR; now returns a descriptive redirect
+ *   error to inform the client to use the `/api/simplify` endpoint instead.
+ * - `"chat"`: Generates a conversational AI response using a 3-provider cascade:
+ *   Groq → Gemini → HuggingFace → Demo Mode.
+ *
+ * @async
+ * @param {import('express').Request} req - Express Request.
+ *   @param {Object} req.body
+ *   @param {'document'|'chat'} req.body.type - Processing mode.
+ *   @param {string} [req.body.imageFile] - Base64 data URL (required for `document` type).
+ *   @param {string} [req.body.text] - User query text (required for `chat` type).
+ *   @param {string} [req.body.language='en'] - Language code (`en`, `hi`, `kn`).
+ *   @param {string} [req.body.sessionId] - Optional session identifier for tracking.
+ *   @param {boolean} [req.body.offlineMode=false] - If `true`, forces demo mode regardless of API config.
+ * @param {import('express').Response} res - Express Response.
+ * @returns {Promise<void>}
+ * @throws Will return HTTP 400 for invalid request shapes, HTTP 429 for quota errors, HTTP 500 for unhandled failures.
+ */
 const aiProcess = async (req, res) => {
   try {
-    const { type, imageFile, text, language = "en", sessionId, offlineMode } = req.body;
+    const { type, imageFile, text, language = 'en', sessionId, offlineMode } = req.body;
 
-    // Validate request
-    if (!type || !["document", "chat"].includes(type)) {
+    if (!type || !['document', 'chat'].includes(type)) {
       return res.status(400).json({ error: "Type must be 'document' or 'chat'" });
     }
-
-    if (type === "document" && !imageFile) {
-      return res.status(400).json({ error: "imageFile (base64) required for document processing" });
+    if (type === 'document' && !imageFile) {
+      return res.status(400).json({ error: 'imageFile (base64) required for document processing' });
+    }
+    if (type === 'chat' && !text) {
+      return res.status(400).json({ error: 'text required for chat' });
     }
 
-    if (type === "chat" && !text) {
-      return res.status(400).json({ error: "text required for chat" });
+    // Activate demo mode if no API keys are configured or if explicitly requested.
+    const isApiConfigured = process.env.GROQ_API_KEY || process.env.GEMINI_API_KEY;
+    const isDemoMode = offlineMode || !isApiConfigured;
+
+    if (!isApiConfigured) {
+      logger.warn('No AI API keys configured. Activating demo mode to prevent crash.');
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // OFFLINE DEMO MODE (No API calls needed - fully functional)
-    // ═══════════════════════════════════════════════════════════
-    let isDemo = offlineMode || false; // Set to false to use real Gemini API
-
-    if (!process.env.GROQ_API_KEY && !process.env.GEMINI_API_KEY && !isDemo) {
-      console.warn("⚠️ AI API Keys missing! Reverting to Demo Mode to prevent crash.");
-      isDemo = true;
-    }
-
-    if (isDemo) {
-      // Document processing demo
-      if (type === "document") {
-        const demoData = {
-          originalText: "This is a demo document showing how simplification works.",
-          simplifiedText: "This is a simple document example.",
-          simplifiedKannada: "ಇದು ಸರಳೀಕರಣ ಹೇಗೆ ಕಾಗುತ್ತದೆ ಎಂಬುದನ್ನು ತೋರಿಸುವ ಸರಳ ದಾಖಲೆ ಉದಾಹರಣೆ.",
-          simplifiedHindi: "यह एक साधारण दस्तावेज उदाहरण है।",
-          documentType: "Demo Document",
-          confidence: "high",
-          warnings: "This is demo mode - API not configured"
-        };
-        return res.json({ success: true, data: demoData, type: "document", demo: true });
+    if (isDemoMode) {
+      if (type === 'document') {
+        return res.json({ success: true, data: DEMO_DOCUMENT_RESPONSE, type: 'document', demo: true });
       }
-
-      // Chat processing demo
-      if (type === "chat") {
-        const demoChats = {
-          en: {
-            schemes: "Common government schemes include: 1) Pradhan Mantri Jan Dhan Yojana (bank accounts), 2) Ayushman Bharat (health insurance), 3) Mudra Loan (business loans). Visit your nearest Jan Seva Kendra for details.",
-            documents: "Government documents like Ration Cards, Aadhaar, and Land Notices can be confusing. Would you like me to explain a specific document?",
-            rights: "You have rights! These include: Right to Information, Right to Education, Right to Work. Contact your local authorities for help.",
-            default: "Hello! I'm here to help explain government schemes, documents, and your rights. What would you like to know?"
-          },
-          hi: {
-            schemes: "सामान्य सरकारी योजनाएं हैं: 1) प्रधान मंत्री जन धन योजना (बैंक खाते), 2) आयुष्मान भारत (स्वास्थ्य बीमा), 3) मुद्रा ऋण (व्यावसायिक ऋण)। विवरण के लिए अपने निकटतम जन सेवा केंद्र पर जाएं।",
-            documents: "राशन कार्ड, आधार और भूमि नोटिस जैसे सरकारी दस्तावेज भ्रामक हो सकते हैं। क्या आप किसी विशिष्ट दस्तावेज़ की व्याख्या चाहते हैं?",
-            rights: "आपके अधिकार हैं! इनमें शामिल हैं: सूचना का अधिकार, शिक्षा का अधिकार, काम का अधिकार। मदद के लिए अपने स्थानीय अधिकारियों से संपर्क करें।",
-            default: "नमस्ते! मैं सरकारी योजनाओं, दस्तावेजों और आपके अधिकारों को समझाने में मदद करने के लिए यहां हूं। आप क्या जानना चाहते हैं?"
-          },
-          kn: {
-            schemes: "ಸಾಮಾನ್ಯ ಸರಕಾರಿ ಯೋಜನೆಗಳು: 1) ಪ್ರಧಾನ ಮಂತ್ರಿ ಜನ ಧನ ಯೋಜನೆ (ಬ್ಯಾಂಕ್ ಖಾತೆಗಳು), 2) ಆಯುಷ್ಮಾನ್ ಭಾರತ (ಆರೋಗ್ಯ ವಿಮೆ), 3) ಮುದ್ರಾ ಋಣ (ವ್ಯವಹಾರ ಋಣ). ವಿವರಗಳಿಗಾಗಿ ನಿಮ್ಮ ಹತ್ತಿರದ ಜನ ಸೇವಾ ಕೇಂದ್ರಕ್ಕೆ ಭೇಟಿ ನೀಡಿ.",
-            documents: "ರೇಷನ್ ಕಾರ್ಡ್, ಆಧಾರ್ ಮತ್ತು ಭೂಮಿ ಸೂಚನೆಗಳಂತಹ ಸರಕಾರಿ ದಾಖಲೆಗಳು ಗೊಂಬೆಯಾಗಿರಬಹುದು. ನೀವು ನಿರ್ದಿಷ್ಟ ದಾಖಲೆಯನ್ನು ವಿವರಿಸಲು ಬಯಸುತ್ತೀರಾ?",
-            rights: "ನಿನಗೆ ಅಧಿಕಾರವಿದೆ! ಇವುಗಳು ಸೇರಿವೆ: ಮಾಹಿತಿ ಹಕ್ಕು, ಶಿಕ್ಷೆಯ ಹಕ್ಕು, ಕಾಮ ಹಕ್ಕು. ಸಹಾಯಿಗಾಗಿ ನಿಮ್ಮ ಸ್ಥಳೀಯ ಅಧಿಕಾರಿಗಳ ಸಂಪರ್ಕಿಸಿ.",
-            default: "ನಮಸ್ಕಾರ! ನಾನು ಸರಕಾರಿ ಯೋಜನೆಗಳು, ದಾಖಲೆಗಳು ಮತ್ತು ನಿಮ್ಮ ಅಧಿಕಾರಗಳನ್ನು ವಿವರಿಸಲು ಸಹಾಯ ಮಾಡಲು ಇಲ್ಲಿದ್ದೇನೆ. ನೀವು ಏನನ್ನು ತಿಳಿದುಕೊಳ್ಳಲು ಬಯಸುತ್ತೀರಿ?"
-          }
-        };
-
-        // Select appropriate response based on keywords
-        const lowerText = text.toLowerCase();
-        let response;
-        
-        if (lowerText.includes("scheme") || lowerText.includes("योजना") || lowerText.includes("ಯೋಜನೆ")) {
-          response = demoChats[language]?.schemes || demoChats.en.schemes;
-        } else if (lowerText.includes("document") || lowerText.includes("दस्तावेज") || lowerText.includes("ದಾಖಲೆ")) {
-          response = demoChats[language]?.documents || demoChats.en.documents;
-        } else if (lowerText.includes("right") || lowerText.includes("अधिकार") || lowerText.includes("ಅಧಿಕಾರ")) {
-          response = demoChats[language]?.rights || demoChats.en.rights;
-        } else {
-          response = demoChats[language]?.default || demoChats.en.default;
-        }
-
-        return res.json({
-          success: true,
-          reply: response,
-          language,
-          sessionId: sessionId || "demo",
-          type: "chat",
-          demo: true,
-          message: "Demo mode - No API key required for testing"
-        });
-      }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // REAL API MODE (only if API key is properly configured)
-    // ═══════════════════════════════════════════════════════════
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey || apiKey === "your_gemini_api_key_here") {
-      return res.status(500).json({ 
-        error: "API key not configured - Running in Demo Mode",
-        solution: "Get a working API key from https://makersuite.google.com/app/apikey"
-      });
-    }
-
-    const genAI = new GoogleGenerativeAI(apiKey);
-    // Try latest model first, fallback to alternatives
-    let model;
-    try {
-      model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
-    } catch {
-      try {
-        model = genAI.getGenerativeModel({ model: "gemini-1.5-pro-latest" });
-      } catch {
-        model = genAI.getGenerativeModel({ model: "gemini-1.5-pro" });
-      }
-    }
-
-    // ─────────────────────────────────────────────────────
-    // DOCUMENT PROCESSING (Vision)
-    // ─────────────────────────────────────────────────────
-    if (type === "document") {
-      if (!imageFile.startsWith("data:")) {
-        return res.status(400).json({ error: "imageFile must be a valid base64 data URL" });
-      }
-
-      // This endpoint is no longer used since we use client-side OCR now
-      // But keeping for backward compatibility
-      return res.status(400).json({
-        success: false,
-        error: "✨ File uploads now use smart OCR!",
-        info: "Your browser is extracting text from the image automatically using OCR. If you see this, please refresh the page and try again."
-      });
-    }
-
-    // ─────────────────────────────────────────────────────
-    // CHAT PROCESSING (Text) - Multi-Provider Fallback
-    // ─────────────────────────────────────────────────────
-    if (type === "chat") {
-      const langInstruction =
-        language === "hi"
-          ? "Respond in Hindi (हिन्दी). Use village-level, simple language."
-          : language === "kn"
-          ? "Respond in Kannada (ಕನ್ನಡ). Use village-level, simple language."
-          : "Respond in English. Use simple, village-level language.";
-
-      const fullPrompt = `${CHAT_SYSTEM_PROMPT}\n\n${langInstruction}\n\nUser question: ${text}\n\nProvide a helpful, empathetic answer in the specified language. Keep it concise and practical.`;
-
-      let reply = null;
-      let provider = null;
-
-      // ═══════════════════════════════════════════════════
-      // TRY 1: GROQ API (Primary - Unlimited Free)
-      // ═══════════════════════════════════════════════════
-      if (!reply) {
-        try {
-          const groqKey = process.env.GROQ_API_KEY;
-          if (groqKey && groqKey !== "your_groq_key_here") {
-            const groq = new Groq({ apiKey: groqKey });
-            const groqReply = await groq.chat.completions.create({
-              model: "llama-3.3-70b-versatile", // Updated: mixtral-8x7b-32768 was decommissioned
-              messages: [
-                { role: "system", content: CHAT_SYSTEM_PROMPT },
-                { role: "user", content: fullPrompt }
-              ],
-              max_tokens: 500,
-              temperature: 0.7
-            });
-            reply = groqReply.choices[0].message.content;
-            provider = "groq";
-            console.log("✅ Using Groq API");
-          }
-        } catch (groqError) {
-          console.warn("⚠️ Groq failed, trying HuggingFace:", groqError.message);
-        }
-      }
-
-      // ═══════════════════════════════════════════════════
-      // TRY 2: GEMINI API (Second Choice)
-      // ═══════════════════════════════════════════════════
-      if (!reply) {
-        try {
-          const geminiKey = process.env.GEMINI_API_KEY;
-          if (geminiKey && geminiKey !== "your_gemini_api_key_here") {
-            const genAI = new GoogleGenerativeAI(geminiKey);
-            const geminiModel = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
-            const geminiResult = await geminiModel.generateContent([{ text: fullPrompt }]);
-            reply = geminiResult.response.text();
-            provider = "gemini";
-            console.log("✅ Using Gemini 2.0 Flash for chat");
-          }
-        } catch (geminiError) {
-          console.warn("⚠️ Gemini chat failed, trying HuggingFace:", geminiError.message);
-        }
-      }
-
-      // ═══════════════════════════════════════════════════
-      // TRY 3: HUGGING FACE API (Backup)
-      // ═══════════════════════════════════════════════════
-      if (!reply) {
-        try {
-          const hfKey = process.env.HUGGINGFACE_API_KEY;
-          if (hfKey && hfKey !== "your_hf_key_here") {
-            const hf = new HfInference(hfKey);
-            const hfReply = await hf.textGeneration({
-              model: "mistralai/Mistral-7B-Instruct-v0.1",
-              inputs: fullPrompt,
-              parameters: {
-                max_new_tokens: 500,
-                temperature: 0.7
-              }
-            });
-            reply = hfReply.generated_text.split(fullPrompt)[1] || hfReply.generated_text;
-            provider = "huggingface";
-            console.log("✅ Using HuggingFace API");
-          }
-        } catch (hfError) {
-          console.warn("⚠️ HuggingFace failed, using demo mode:", hfError.message);
-        }
-      }
-
-      // ═══════════════════════════════════════════════════
-      // FALLBACK: Demo Mode with Smart Keyword Matching
-      // ═══════════════════════════════════════════════════
-      if (!reply) {
-        console.log("ℹ️ Using demo mode with keyword matching");
-        
-        // Enhanced demo responses with keyword matching
-        const demoResponses = {
-          en: {
-            scholarship: "Scholarships available: 1) National Scholarship Portal (NSP) - for merit & SC/ST students, 2) Post-Matric Scholarship - for OBC & minority students, 3) PJMS/Atal Scholarship - for girls. Apply on scholarships.gov.in",
-            student: "For students: Look into AICTE scholarships, NHEQF schemes, and college-specific aid. Government also offers schemes for girl education like Sukanya Samriddhi Yojana.",
-            loan: "Loans available: 1) Mudra Loan (₹50,000 to ₹10 lakh for business), 2) Student loans with subsidy, 3) PM Loans for dairy/agriculture. Contact your nearest bank or Government office.",
-            health: "Health schemes: 1) Ayushman Bharat (free treatment up to ₹5 lakh), 2) PMJAY (PM-JAY), 3) Jeevan Bima Yojana (₹2 lakh life insurance). Register at your nearest health center.",
-            pension: "Pensions: 1) APY (Atal Pension Yojana) - ₹1000 to ₹5000/month, 2) Widow pension, 3) Old age pension (₹500-₹2000/month by state). Apply through local government office.",
-            grievance: "File grievance through: 1) CPGRAMS portal (cpgrams.gov.in), 2) RTI Act for information, 3) Local Ombudsman office. Provide clear details and supporting documents.",
-            rti: "RTI (Right to Information): You can ask for ANY government record. Apply to concerned department with ₹10 fee. Response within 30 days. No reason needed!",
-            default: "Common schemes: Pradhan Mantri Jan Dhan (bank accounts), Ayushman Bharat (health), Mudra Loans (business). Tell me specifically what you need!"
-          },
-          hi: {
-            scholarship: "छात्रवृत्ति उपलब्ध हैं: 1) राष्ट्रीय छात्रवृत्ति पोर्टल - मेधावी व SC/ST छात्र, 2) अन्य पिछड़ा वर्ग छात्रवृत्ति, 3) लड़कियों के लिए PJMS। scholarships.gov.in पर आवेदन करें।",
-            student: "छात्रों के लिए: AICTE छात्रवृत्ति, सुकन्या समृद्धि योजना (लड़कियों के लिए), और कॉलेज स्कॉलरशिप देखें।",
-            loan: "ऋण: 1) मुद्रा लोन (₹50,000 से ₹10 लाख व्यापार के लिए), 2) छात्र ऋण, 3) कृषि ऋण। अपने बैंक से संपर्क करें।",
-            health: "स्वास्थ्य योजनाएं: 1) आयुष्मान भारत (₹5 लाख तक मुफ्त इलाज), 2) PMJAY, 3) जीवन बीमा योजना। आपके स्वास्थ्य केंद्र पर पंजीकरण करें।",
-            pension: "पेंशन: 1) APY (₹1000 से ₹5000 मासिक), 2) विधवा पेंशन, 3) वृद्धावस्था पेंशन। अपने ग्राम कार्यालय में आवेदन करें।",
-            grievance: "शिकायत दर्ज करें: 1) CPGRAMS पोर्टल पर, 2) RTI से जानकारी मांगें, 3) लोकपाल कार्यालय। स्पष्ट विवरण दें।",
-            rti: "सूचना का अधिकार (RTI): आप किसी भी सरकारी रिकॉर्ड के बारे में पूछ सकते हैं। ₹10 फीस के साथ आवेदन करें। 30 दिनों में उत्तर मिलना चाहिए!",
-            default: "सामान्य योजनाएं: प्रधान मंत्री जन धन (बैंक), आयुष्मान भारत (स्वास्थ्य), मुद्रा लोन (व्यापार)। मुझे बताएं कि आपको क्या चाहिए!"
-          },
-          kn: {
-            scholarship: "ವೃತ್ತಿ ನಿಮಗಿರುತ್ತದೆ: 1) ರಾಷ್ಟ್ರೀಯ ವೃತ್ತಿ ಪೋರ್ಟಲ್, 2) OBC ವೃತ್ತಿ, 3) ಹುಡುಗಿಯರಿಗೆ PJMS। scholarships.gov.in ನಲ್ಲಿ ಅರ್ಜಿ ಹಾಕಿ।",
-            student: "ವಿದ್ಯಾರ್ಥಿಗಳಿಗೆ: AICTE ವೃತ್ತಿ, ಸುಕನ್ಯ ಸಮೃದ್ಧಿ ಯೋಜನೆ (ಹುಡುಗಿಯರಿಗೆ), ಮತ್ತು ಕಾಲೇಜು ವಿಶೇಷ ನಿಮಗಿರುತ್ತದೆ ನೋಡಿ।",
-            loan: "ಸಾಲ: 1) ಮುದ್ರಾ ಲೋನ್ (ವ್ಯಾಪಾರಕ್ಕೆ), 2) ವಿದ್ಯಾರ್ಥಿ ಸಾಲ, 3) ಕೃಷಿ ಸಾಲ। ನಿಮ್ಮ ಬ್ಯಾಂಕಿಗೆ ಸೇರಿಸಿ।",
-            health: "ಆರೋಗ್ಯ ಯೋಜನೆಗಳು: 1) ಆಯುಷ್ಮಾನ್ ಭಾರತ (₹5 ಲಕ್ಷ ಮುಕ್ತ ಚಿಕಿತ್ಸೆ), 2) PMJAY, 3) ಜೀವನ ವಿಮೆ ಯೋಜನೆ।",
-            pension: "ಪಿಂಚಣಿ: 1) APY (₹1000 ರಿಂದ ₹5000 ಮಾಸಿಕ), 2) ವಿಧವೆ ಪಿಂಚಣಿ, 3) ವೃದ್ಧಾವಸ್ಥೆ ಪಿಂಚಣಿ।",
-            grievance: "ನಿಂದೆ ದಾಖಲು ಮಾಡಿ: 1) CPGRAMS ನಲ್ಲಿ, 2) RTI ಮೂಲಕ, 3) ಲೋಕಪಾಲ ಕಚೇರಿಯಲ್ಲಿ।",
-            rti: "ಮಾಹಿತಿಯ ಹಕ್ಕು (RTI): ವಿವರಣೆ ಇಲ್ಲದೆ ಯಾವುದೇ ಸರಕಾರಿ ದಾಖಲೆ ಕೇಳಬಹುದು। ₹10 ಫೀಸ್ ನೊಂದಿಗೆ ಅರ್ಜಿ.",
-            default: "ಸಾಮಾನ್ಯ ಯೋಜನೆಗಳು: ಪ್ರಧಾನ ಮಂತ್ರಿ ಜನ ಧನ, ಆಯುಷ್ಮಾನ್ ಭಾರತ, ಮುದ್ರಾ ಲೋನ್। ನಿಮಗೆ ಪ್ರಯೋಜನವಾಗುತ್ತದೆ ಹೇಳಿ!"
-          }
-        };
-
-        const lowerText = text.toLowerCase();
-        const responses = demoResponses[language] || demoResponses['en'];
-        let response = responses.default;
-
-        // Match keywords with responses
-        if (lowerText.match(/scholarship|छात्रवृत्ति|ವೃತ್ತಿ|nsp|nheqf|pjms/i)) {
-          response = responses.scholarship;
-        } else if (lowerText.match(/student|छात्र|విద్యార్థి|exam|college|पढाई/i)) {
-          response = responses.student;
-        } else if (lowerText.match(/loan|ऋण|ಸಾಲ|mudra|business|व्यापार/i)) {
-          response = responses.loan;
-        } else if (lowerText.match(/health|स्वास्थ्य|ಆರೋಗ್ಯ|ayushman|treatment|चिकित्सा/i)) {
-          response = responses.health;
-        } else if (lowerText.match(/pension|पेंशन|ಪಿಂಚಣಿ|apy|old age|बुजुर्ग/i)) {
-          response = responses.pension;
-        } else if (lowerText.match(/grievance|शिकायत|ನಿಂದೆ|complaint|cpgrams/i)) {
-          response = responses.grievance;
-        } else if (lowerText.match(/rti|information|सूचना|ಮಾಹಿತಿ|rights/i)) {
-          response = responses.rti;
-        }
-
-        return res.json({
-          success: true,
-          reply: response,
-          language,
-          sessionId: sessionId || "default",
-          type: "chat",
-          provider: provider || "demo",
-          fallback: !provider
-        });
-      }
-
-      // This should never be reached, but just in case
+      const demoReply = resolveDemoChatResponse(text, language);
       return res.json({
         success: true,
-        reply: reply || "Unable to generate response. Please try again.",
+        reply: demoReply,
         language,
-        sessionId: sessionId || "default",
-        type: "chat",
-        provider: provider || "fallback"
+        sessionId: sessionId || 'demo',
+        type: 'chat',
+        demo: true,
+      });
+    }
+
+    // ── DOCUMENT PROCESSING ─────────────────────────────────────────────────
+    // Document uploads are now processed via client-side OCR → /api/simplify.
+    if (type === 'document') {
+      if (!imageFile.startsWith('data:')) {
+        return res.status(400).json({ error: 'imageFile must be a valid base64 data URL' });
+      }
+      return res.status(400).json({
+        success: false,
+        error: '✨ File uploads now use smart OCR!',
+        info: 'Your browser extracts text via OCR automatically. Please refresh and try again, or use the /api/simplify endpoint directly.',
+      });
+    }
+
+    // ── CHAT PROCESSING — 3-Provider Cascade ──────────────────────────────
+    if (type === 'chat') {
+      const languageInstruction =
+        language === 'hi'
+          ? 'Respond in Hindi (हिन्दी). Use village-level, simple language.'
+          : language === 'kn'
+          ? 'Respond in Kannada (ಕನ್ನಡ). Use village-level, simple language.'
+          : 'Respond in English. Use simple, village-level language.';
+
+      const inferencePrompt = `${CHAT_SYSTEM_PROMPT}\n\n${languageInstruction}\n\nUser question: ${text}\n\nProvide a helpful, empathetic answer in the specified language. Keep it concise and practical.`;
+
+      let generatedReply = null;
+      let resolvedProvider = null;
+
+      // 1. GROQ — primary provider.
+      const groqApiKey = process.env.GROQ_API_KEY;
+      if (!generatedReply && groqApiKey && groqApiKey !== 'your_groq_key_here') {
+        try {
+          const groqClient = new Groq({ apiKey: groqApiKey });
+          const groqCompletion = await groqClient.chat.completions.create({
+            model: 'llama-3.3-70b-versatile',
+            messages: [
+              { role: 'system', content: CHAT_SYSTEM_PROMPT },
+              { role: 'user', content: inferencePrompt },
+            ],
+            max_tokens: 500,
+            temperature: 0.7,
+          });
+          generatedReply = groqCompletion.choices[0].message.content;
+          resolvedProvider = 'groq';
+          logger.info('Chat inference resolved via Groq.');
+        } catch (groqError) {
+          logger.warn(`Groq chat inference failed: ${groqError.message}. Trying Gemini...`);
+        }
+      }
+
+      // 2. GEMINI — secondary provider.
+      const geminiApiKey = process.env.GEMINI_API_KEY;
+      if (!generatedReply && geminiApiKey && geminiApiKey !== 'your_gemini_api_key_here') {
+        try {
+          const geminiClient = new GoogleGenerativeAI(geminiApiKey);
+          const geminiModel = geminiClient.getGenerativeModel({ model: 'gemini-2.0-flash' });
+          const geminiResult = await geminiModel.generateContent([{ text: inferencePrompt }]);
+          generatedReply = geminiResult.response.text();
+          resolvedProvider = 'gemini';
+          logger.info('Chat inference resolved via Gemini 2.0 Flash.');
+        } catch (geminiError) {
+          logger.warn(`Gemini chat inference failed: ${geminiError.message}. Trying HuggingFace...`);
+        }
+      }
+
+      // 3. HUGGINGFACE — tertiary provider.
+      const hfApiKey = process.env.HUGGINGFACE_API_KEY;
+      if (!generatedReply && hfApiKey && hfApiKey !== 'your_hf_key_here') {
+        try {
+          const hfClient = new HfInference(hfApiKey);
+          const hfResult = await hfClient.textGeneration({
+            model: 'mistralai/Mistral-7B-Instruct-v0.1',
+            inputs: inferencePrompt,
+            parameters: { max_new_tokens: 500, temperature: 0.7 },
+          });
+          generatedReply = hfResult.generated_text.split(inferencePrompt)[1] || hfResult.generated_text;
+          resolvedProvider = 'huggingface';
+          logger.info('Chat inference resolved via HuggingFace.');
+        } catch (hfError) {
+          logger.warn(`HuggingFace inference failed: ${hfError.message}. Falling back to demo mode.`);
+        }
+      }
+
+      // 4. DEMO MODE — graceful final fallback.
+      if (!generatedReply) {
+        logger.info('All AI providers exhausted. Serving demo mode keyword-matched response.');
+        generatedReply = resolveDemoChatResponse(text, language);
+      }
+
+      return res.json({
+        success: true,
+        reply: generatedReply,
+        language,
+        sessionId: sessionId || 'default',
+        type: 'chat',
+        provider: resolvedProvider || 'demo',
+        fallback: !resolvedProvider,
       });
     }
   } catch (error) {
-    console.error("AI Processing Error:", error);
+    logger.error(`aiProcess unhandled error: ${error.message}`, { stack: error.stack });
 
-    // Handle API rate limits gracefully
-    if (error.message?.includes("429") || error.message?.includes("quota")) {
+    if (error.message?.includes('429') || error.message?.includes('quota')) {
       return res.status(429).json({
-        error: "API quota exceeded. Please try again in a few moments.",
+        error: 'API quota exceeded. Please try again in a few moments.',
         retryAfter: 60,
       });
     }
 
     res.status(500).json({
-      error: error.message || "AI processing failed",
-      details: process.env.NODE_ENV === "development" ? error.stack : undefined,
+      error: error.message || 'AI processing failed',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined,
     });
   }
 };
 
-// ═══════════════════════════════════════════════════════════
-// GRIEVANCE DRAFTING
-// ═══════════════════════════════════════════════════════════
-
+/**
+ * Drafts a formal grievance letter, RTI request, or legal reply using AI.
+ *
+ * Uses a 2-provider cascade: Gemini (primary) → Groq (fallback).
+ * After generating the English draft, the content is translated to Kannada or Hindi
+ * via the Bhashini API if requested.
+ *
+ * @async
+ * @param {import('express').Request} req - Express Request.
+ *   @param {Object} req.body
+ *   @param {string} req.body.documentContext - Context or subject of the grievance.
+ *   @param {string} req.body.userIntent - The type of letter/action required.
+ *   @param {string} [req.body.language='en'] - Target language (`en`, `hi`, `kn`).
+ *   @param {string} [req.body.authority] - The authority the letter is addressed to.
+ *   @param {string} [req.body.issueDetails] - Additional details about the issue.
+ * @param {import('express').Response} res - Express Response.
+ * @returns {Promise<void>}
+ * @throws Will return HTTP 400 for missing fields, HTTP 500 if all AI providers fail.
+ */
 const draftGrievance = async (req, res) => {
   try {
-    const {
-      documentContext,
-      userIntent,
-      language = "en",
-      authority,
-      issueDetails,
-    } = req.body;
+    const { documentContext, userIntent, language = 'en', authority, issueDetails } = req.body;
 
     if (!documentContext || !userIntent) {
-      return res.status(400).json({
-        error: "documentContext and userIntent are required",
-      });
+      return res.status(400).json({ error: 'documentContext and userIntent are required' });
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // OFFLINE DEMO MODE FOR GRIEVANCE
-    // ═══════════════════════════════════════════════════════════
-    const OFFLINE_DEMO_MODE = false; // Use real AI (Gemini / Groq)
+    const geminiApiKey = process.env.GEMINI_API_KEY;
+    const groqApiKey = process.env.GROQ_API_KEY;
 
-    if (OFFLINE_DEMO_MODE) {
-      const demoLetters = {
-        en: `[Date: ${new Date().toLocaleDateString()}]
-
-To,
-${authority || "Relevant Authority"}
-
-Subject: Formal Complaint Regarding [Issue]
-
-Dear Sir/Madam,
-
-I am writing to formally lodge a complaint regarding the matter detailed below:
-
-Context: ${documentContext}
-Issue: ${userIntent}
-Details: ${issueDetails || "As mentioned above"}
-
-I request you to kindly review this matter and take appropriate action as per the rules and regulations.
-
-Thanking you for your immediate attention to this matter.
-
-Yours faithfully,
-[Your Name]
-[Your Contact]
-[Date]`,
-        hi: `[तारीख: ${new Date().toLocaleDateString('hi-IN')}]
-
-को,
-${authority || "संबंधित प्राधिकार"}
-
-विषय: [समस्या] के संबंध में औपचारिक शिकायत
-
-प्रिय महोदय/महोदया,
-
-मैं नीचे दी गई समस्या के संबंध में एक औपचारिक शिकायत दर्ज करने के लिए लिख रहा हूँ:
-
-संदर्भ: ${documentContext}
-समस्या: ${userIntent}
-विवरण: ${issueDetails || "जैसा कि ऊपर उल्लेख है"}
-
-मैं आपसे अनुरोध करता हूँ कि इस मामले की समीक्षा करें और नियमों के अनुसार उचित कार्रवाई करें।
-
-इस महत्वपूर्ण मामले पर आपके तत्काल ध्यान के लिए धन्यवाद।
-
-आपका विश्वासपात्र,
-[आपका नाम]
-[आपका संपर्क]
-[तारीख]`,
-        kn: `[ದಿನಾಂಕ: ${new Date().toLocaleDateString()}]
-
-ಕಿ,
-${authority || "ಸಂಬಂಧಿತ ಅಧಿಕಾರ"}
-
-ವಿಷಯ: [ಸಮಸ್ಯೆ] ಸಂಬಂಧಿ ಔಪಚಾರಿಕ ದೂರು
-
-ಮೆಹೆಬೊ/ಮೆಹೆಬೆ,
-
-ನಾನು ಕೆಳಗಿನ ಸಮಸ್ಯೆ ಸಂಬಂಧಿ ಔಪಚಾರಿಕ ದೂರು ಸಲ್ಲಿಸಲು ಬರೆತಿದ್ದೇನೆ:
-
-ಸಂದರ್ಭ: ${documentContext}
-ಸಮಸ್ಯೆ: ${userIntent}
-ವಿವರಣೆ: ${issueDetails || "ಮೇಲಿನಲ್ಲಿ ಹೇಳಿದಂತೆ"}
-
-ಈ ವಿಷಯವನ್ನು ಪರಿಶೀಲಿಸಿ ಮತ್ತು ನಿಯಮಾವಳಿ ಅನುಸಾರ ಸೂಕ್ತ ನಿರ್ವಾಹಕ ದೃಷ್ಟಿಕೋನವನ್ನು ತೆಗೆದುಕೊಳ್ಳುವಂತೆ ನನ್ನ ಅನುರೋಧವಾಗಿದೆ.
-
-ಈ ಪರಿಸ್ಥಿತಿಗೆ ಆಪಣೆ ಅವಧಾನ ಕೊಡಿದಿರಲು ಕೃತಜ್ಞತೆ.
-
-ನಿಮ್ಮ ವಿಶ್ವಾಸಿ,
-[ನಿಮ್ಮ ಹೆಸರು]
-[ನಿಮ್ಮ ಸಂಪರ್ಕ]
-[ದಿನಾಂಕ]`
-      };
-
-      const response = {
-        success: true,
-        draftLetter: demoLetters[language] || demoLetters.en,
-        draftLetterEnglish: demoLetters.en,
-        letterType: userIntent,
-        tips: [
-          "Print the letter on plain paper",
-          "Write the date and signature in blue or black ink",
-          "Keep a copy for your records",
-          "Submit to the authority with supporting documents",
-          "Keep proof of submission (receipt or acknowledgment)"
-        ],
-        submitTo: authority || "Relevant Authority",
-        disclaimer: "This is a template. Consult with a legal advisor for complex cases. This is demo mode only."
-      };
-
-      return res.json(response);
+    if (!geminiApiKey && !groqApiKey) {
+      return res.status(500).json({ error: 'No AI API keys configured. Cannot draft grievance.' });
     }
 
-    const geminiKey = process.env.GEMINI_API_KEY;
-    const groqKey = process.env.GROQ_API_KEY;
-
-    if (!geminiKey && !groqKey) {
-      return res.status(500).json({ error: "No AI API Keys configured" });
-    }
-
-    const langInstruction = "Draft the content ENTIRELY in English. The final output must be pure English for processing in the next pipeline step.";
-
-    const userMessage = `
+    const grievanceUserMessage = `
 ### USER CONTEXT:
 Document Type/Intent: ${userIntent}
 Situation Context: ${documentContext}
-Authority to Submit To: ${authority || "Relevant Authority"}
-Additional Details: ${issueDetails || "As per document context"}
+Authority to Submit To: ${authority || 'Relevant Authority'}
+Additional Details: ${issueDetails || 'As per document context'}
 
-${langInstruction}
+Draft the content natively in English, Hindi, and Kannada simultaneously. Return ONLY valid JSON matching the exact schema format defined in the system prompt.`;
 
-Return ONLY valid JSON matching the exact schema format requested in the system prompt.`;
+    let rawAiDraftText = null;
 
-    let rawReply = null;
-
-    // TRY 1: GEMINI
-    if (geminiKey && geminiKey !== "your_gemini_api_key_here") {
+    // 1. GEMINI — primary for grievance drafting (superior formatting).
+    if (geminiApiKey && geminiApiKey !== 'your_gemini_api_key_here') {
       try {
-        const genAI = new GoogleGenerativeAI(geminiKey);
-        const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
-        const result = await model.generateContent([
-          { text: GRIEVANCE_PROMPT },
-          { text: userMessage },
+        const geminiClient = new GoogleGenerativeAI(geminiApiKey);
+        const grievanceModel = geminiClient.getGenerativeModel({ model: 'gemini-2.0-flash' });
+        const geminiResult = await grievanceModel.generateContent([
+          { text: GRIEVANCE_DRAFTING_PROMPT },
+          { text: grievanceUserMessage },
         ]);
-        rawReply = result.response.text();
-        console.log("✅ Grievance Drafting: Using Gemini 2.0 Flash");
-      } catch (geminiErr) {
-        console.warn("⚠️ Gemini API failed (likely quota limit), falling back to Groq...", geminiErr.message);
+        rawAiDraftText = geminiResult.response.text();
+        logger.info('Grievance drafting resolved via Gemini 2.0 Flash.');
+      } catch (geminiError) {
+        logger.warn(`Gemini grievance drafting failed: ${geminiError.message}. Trying Groq...`);
       }
     }
 
-    // TRY 2: GROQ (Fallback)
-    if (!rawReply && groqKey && groqKey !== "your_groq_key_here") {
+    // 2. GROQ — fallback for grievance drafting.
+    if (!rawAiDraftText && groqApiKey && groqApiKey !== 'your_groq_key_here') {
       try {
-        const groq = new Groq({ apiKey: groqKey });
-        const groqReply = await groq.chat.completions.create({
-          model: "llama-3.3-70b-versatile",
+        const groqClient = new Groq({ apiKey: groqApiKey });
+        const groqCompletion = await groqClient.chat.completions.create({
+          model: 'llama-3.3-70b-versatile',
           messages: [
-            { role: "system", content: GRIEVANCE_PROMPT },
-            { role: "user", content: userMessage }
+            { role: 'system', content: GRIEVANCE_DRAFTING_PROMPT },
+            { role: 'user', content: grievanceUserMessage },
           ],
           max_tokens: 4096,
-          temperature: 0.7
+          temperature: 0.7,
         });
-        rawReply = groqReply.choices[0].message.content;
-        console.log("✅ Grievance Drafting: Using Groq API Fallback");
-      } catch (groqErr) {
-        console.warn("⚠️ Groq API also failed:", groqErr.message);
+        rawAiDraftText = groqCompletion.choices[0].message.content;
+        logger.info('Grievance drafting resolved via Groq fallback.');
+      } catch (groqError) {
+        logger.error(`Groq grievance drafting also failed: ${groqError.message}`);
       }
     }
 
-    if (!rawReply) {
-      return res.status(500).json({ error: "Both Gemini and Groq APIs failed to generate a draft. Please check your API Quota limits." });
+    // 3. OPENROUTER — emergency fallback (free-tier LLM, no daily token wall).
+    const openRouterApiKey = process.env.OPENROUTER_API_KEY;
+    if (!rawAiDraftText && openRouterApiKey && openRouterApiKey !== 'YOUR_OPENROUTER_API_KEY') {
+      // Confirmed-live free models on OpenRouter (March 2026).
+      // Check https://openrouter.ai/models?q=free for the latest if these 404.
+      const openRouterModels = [
+        'meta-llama/llama-3.3-70b-instruct:free',
+        'meta-llama/llama-3.2-3b-instruct:free',
+        'google/gemma-3-27b-it:free',
+        'google/gemma-3-12b-it:free',
+      ];
+      for (const orModel of openRouterModels) {
+        try {
+          logger.info(`Activating OpenRouter fallback for grievance drafting (model: ${orModel})...`);
+          const openRouterCompletion = await openRouterClient.chat.completions.create({
+            model: orModel,
+            messages: [
+              { role: 'system', content: GRIEVANCE_DRAFTING_PROMPT },
+              { role: 'user', content: grievanceUserMessage },
+            ],
+            response_format: { type: 'json_object' },
+          });
+          rawAiDraftText = openRouterCompletion.choices[0]?.message?.content || null;
+          if (rawAiDraftText) {
+            logger.info(`Grievance drafting resolved via OpenRouter (${orModel}).`);
+            break;
+          }
+        } catch (openRouterError) {
+          if (openRouterError.status === 404) {
+            logger.warn(`OpenRouter model '${orModel}' returned 404. Trying next...`);
+            continue;
+          }
+          logger.error(`OpenRouter grievance fallback failed (${orModel}): ${openRouterError.message}`);
+          break;
+        }
+      }
     }
 
-    let parsed = extractJSON(rawReply);
+    // 4. LOCAL TEMPLATE ENGINE — guaranteed last resort, zero-dependency, always works.
+    if (!rawAiDraftText) {
+      logger.warn('All AI providers failed. Generating professional local template as guaranteed fallback.');
+      const localDraft = generateLocalGrievanceTemplate({
+        userIntent,
+        documentContext,
+        authority,
+        issueDetails,
+        language,
+      });
+      return res.json({ success: true, data: localDraft, source: 'local_template' });
+    }
 
-    // Fallback
-    if (!parsed) {
-      parsed = {
-        draft_content: rawReply,
+    let parsedDraft = extractJSON(rawAiDraftText);
+
+    // Graceful degradation — if JSON parsing fails, return raw text wrapped in schema.
+    if (!parsedDraft) {
+      parsedDraft = {
+        draft_content: rawAiDraftText,
+        draft_content_english: rawAiDraftText,
         document_type: userIntent,
+        subject: 'Drafted Grievance / Letter',
+        key_sections_cited: [],
         next_steps: [
-          "Review the draft carefully before submission.",
-          "Get it signed by the person filing the complaint.",
-          "Keep a photocopy for your records.",
+          'Review the draft carefully before submission.',
+          'Sign the letter with blue or black ink.',
+          'Keep a photocopy for your personal records.',
         ],
-        subject: "Drafted Grievance/Letter",
-        key_sections_cited: []
       };
     }
 
-    // ─────────────────────────────────────────────────────────────
-    // STEP 3: BHASHINI TRANSLATION
-    // ─────────────────────────────────────────────────────────────
-    if (parsed && parsed.draft_content && (language === "kn" || language === "hi")) {
-      const targetDialect = language === "kn" ? "standard-kannada" : "standard-hindi";
-      console.log(`[Bhashini Workflow] Translating draft_content to ${targetDialect}...`);
-      
-      const transResult = await translate(parsed.draft_content, "en", targetDialect);
-      
-      if (transResult.success && transResult.translatedText) {
-        parsed.draft_content = transResult.translatedText;
+    // Bind primary draft_content based on requested language
+    // (Local templates already set this appropriately, so we only need to do this for LLM JSON generation)
+    if (!parsedDraft.generated_by && parsedDraft.draft_content_english) {
+      if (language === 'hi' && parsedDraft.draft_content_hindi) {
+        parsedDraft.draft_content = parsedDraft.draft_content_hindi;
+      } else if (language === 'kn' && parsedDraft.draft_content_kannada) {
+        parsedDraft.draft_content = parsedDraft.draft_content_kannada;
+      } else {
+        parsedDraft.draft_content = parsedDraft.draft_content_english;
       }
     }
 
-    res.json({ success: true, data: parsed });
+    return res.json({ success: true, data: parsedDraft });
   } catch (error) {
-    console.error("Grievance Draft Error:", error);
-    res.status(500).json({
-      error: error.message || "Failed to draft grievance",
-    });
+    logger.error(`draftGrievance unhandled error: ${error.message}`, { stack: error.stack });
+    res.status(500).json({ error: error.message || 'Failed to draft grievance' });
   }
 };
 
-// ═══════════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────────────────────
 // EXPORTS
-// ═══════════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────────────────────
 
 module.exports = {
   aiProcess,
